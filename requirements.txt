@@ -1,4 +1,7 @@
 python-telegram-bot==20.7
-requests
 schedule
 python-dotenv
+beautifulsoup4
+lxml
+cloudscraper
+ 
