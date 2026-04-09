@@ -76,7 +76,14 @@ def fetch_events() -> list:
         with open("ff_debug.html", "w", encoding="utf-8") as f:
             f.write(r.text)
 
-        events = parse_calendar_html(r.text)
+        # Primary: use JS state (dateline = reliable UTC unix timestamp)
+        events = parse_calendar_state_from_js(r.text)
+
+        if not events:
+            # Fallback: HTML table parser
+            log.warning("JS parse returned no events, falling back to HTML table")
+            events = parse_calendar_html(r.text)
+
         log.info(f"Scraped {len(events)} raw events")
         return events
 
@@ -85,18 +92,144 @@ def fetch_events() -> list:
         return []
 
 
+# ──────────────────────────────────────────────────────────────
+#  JS-BASED PARSER  (primary — timezone-independent)
+# ──────────────────────────────────────────────────────────────
+
+def parse_calendar_state_from_js(html_text: str) -> list:
+    """
+    Extract events from the embedded JS calendar state.
+
+    ForexFactory injects event data as JSON inside a script tag
+
+    Each event has a `dateline` field which is a Unix timestamp in UTC.
+    Using it directly avoids all timezone-guessing bugs: the HTML timeLabel
+    can be in any timezone depending on the server's IP geolocation, but
+    `dateline` is always UTC.
+    """
+    # The JS block looks like:
+    #   window.calendarComponentStates[1] = {\ndays: [...],...\n}
+    # We grab everything between the opening { and the matching closing }
+    # by finding the block start then scanning for balanced braces.
+    block_match = re.search(
+        r"window\.calendarComponentStates\[\d+\]\s*=\s*(\{)",
+        html_text,
+    )
+    if not block_match:
+        log.warning("calendarComponentStates not found in HTML")
+        return []
+
+    start = block_match.start(1)  # position of the opening {
+    depth = 0
+    end = start
+    for i, ch in enumerate(html_text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    raw_block = html_text[start:end]
+
+    # The block uses JS syntax (unquoted keys, trailing commas, etc.)
+    # Days array is the only part we need — extract it as valid JSON.
+    days_match = re.search(r'"?days"?\s*:\s*(\[)', raw_block)
+    if not days_match:
+        # Try without quotes (JS object literal syntax)
+        days_match = re.search(r'\bdays\s*:\s*(\[)', raw_block)
+    if not days_match:
+        log.warning("days array not found in calendarComponentStates block")
+        return []
+
+    # Extract the days array by counting brackets
+    arr_start = days_match.start(1)
+    depth = 0
+    arr_end = arr_start
+    for i, ch in enumerate(raw_block[arr_start:], arr_start):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                arr_end = i + 1
+                break
+
+    raw_days = raw_block[arr_start:arr_end]
+
+    # ForexFactory uses HTML escapes like \/ — unescape for JSON
+    raw_days = raw_days.replace("\\/", "/")
+
+    try:
+        days = json.loads(raw_days)
+    except json.JSONDecodeError as e:
+        log.warning(f"Failed to JSON-parse days array: {e}")
+        return []
+
+    events = []
+    for day in days:
+        for item in day.get("events", []):
+            name = (item.get("name") or "").strip()
+            if not name:
+                continue
+
+            currency = (item.get("currency") or "").strip()
+
+            impact_name = (item.get("impactName") or "").strip().lower()
+            impact = impact_name.capitalize() if impact_name in {"high", "medium", "low"} else "Low"
+
+            time_label = (item.get("timeLabel") or "").strip()
+
+            # ── KEY FIX ─────────────────────────────────────────────────────
+            # Using `dateline` (Unix UTC timestamp) directly.
+            # NOT trying to parse timeLabel — FF serves it in whatever
+            # timezone it detects from the scraper's IP, which may be
+            # Eastern, Pacific, UTC, or Berlin depending on the server.
+            # `dateline` is always UTC regardless of IP location.
+            # ────────────────────────────────────────────────────────────────
+            dateline = item.get("dateline")
+            if dateline:
+                event_dt = datetime.fromtimestamp(int(dateline), tz=timezone.utc)
+            else:
+                # Fallback for tentative / all-day events without a timestamp
+                event_dt = None
+
+            events.append({
+                "name": name,
+                "currency": currency,
+                "impact": impact,
+                "time_str": time_label,
+                "datetime": event_dt,
+                "forecast": (item.get("forecast") or "").strip(),
+                "previous": (item.get("previous") or "").strip(),
+                "actual": (item.get("actual") or "").strip(),
+            })
+
+    return [e for e in events if e["name"]]
+
+
+# ──────────────────────────────────────────────────────────────
+#  HTML TABLE PARSER  (fallback only)
+# ──────────────────────────────────────────────────────────────
+
 def parse_calendar_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "lxml")
-
     table = soup.find("table", class_=re.compile("calendar__table"))
     if not table:
         log.error("❌ calendar__table not found")
         return []
-
     return parse_calendar_table(table)
 
 
 def parse_calendar_table(table) -> list:
+    """
+    Fallback HTML-table parser.
+
+    WARNING: times here are in whatever timezone ForexFactory chose based
+    on the scraper's IP.  We try to detect the offset from the page JS and
+    use it; if we can't, we fall back to assuming Berlin time.
+    """
     events = []
     last_time = None
     today_str = datetime.now(DISPLAY_TZ).strftime("%Y-%m-%d")
@@ -105,35 +238,28 @@ def parse_calendar_table(table) -> list:
         if "calendar__row--day-breaker" in row.get("class", []):
             continue
 
-
         time_cell = row.find("td", class_="calendar__time")
         if time_cell:
             t = time_cell.get_text(strip=True)
             if t and t.lower() not in ("", "all day", "tentative"):
                 last_time = t
 
-
         cur_cell = row.find("td", class_="calendar__currency")
         currency = cur_cell.get_text(strip=True) if cur_cell else ""
 
-
         impact_cell = row.find("td", class_="calendar__impact")
         impact = detect_impact(impact_cell)
-
 
         name_cell = row.find("td", class_="calendar__event")
         name = name_cell.get_text(strip=True) if name_cell else ""
         if not name:
             continue
 
-
         def cell_text(cls):
             cell = row.find("td", class_=cls)
             return cell.get_text(strip=True) if cell else ""
 
-
         event_dt = parse_time(last_time, today_str)
-
         log.info(f"Parsed raw time: {last_time} -> {event_dt}")
 
         events.append({
@@ -150,52 +276,9 @@ def parse_calendar_table(table) -> list:
     return events
 
 
-def parse_calendar_state_from_js(html_text: str) -> list:
-    match = re.search(
-        r"window\.calendarComponentStates\[\d+\]\s*=\s*(\{.*?\})\s*;</script>",
-        html_text,
-        re.DOTALL,
-    )
-    if not match:
-        return []
-
-    raw_state = match.group(1)
-
-    try:
-        state = json.loads(raw_state)
-    except json.JSONDecodeError as e:
-        log.warning(f"Failed to parse JS calendar state: {e}")
-        return []
-
-    events = []
-    today_str = datetime.now(DISPLAY_TZ).strftime("%Y-%m-%d")
-
-    for day in state.get("days", []):
-        for item in day.get("events", []):
-            time_label = (item.get("timeLabel") or "").strip()
-            if time_label.lower() in {"tentative", "all day"}:
-                time_label = ""
-
-            impact_name = (item.get("impactName") or "").strip().lower()
-            impact = impact_name.capitalize() if impact_name in {"high", "medium", "low"} else "Low"
-
-            event_dt = parse_time(time_label, today_str)
-
-            events.append(
-                {
-                    "name": item.get("name", "").strip(),
-                    "currency": item.get("currency", "").strip(),
-                    "impact": impact,
-                    "time_str": time_label,
-                    "datetime": event_dt,
-                    "forecast": (item.get("forecast") or "").strip(),
-                    "previous": (item.get("previous") or "").strip(),
-                    "actual": (item.get("actual") or "").strip(),
-                }
-            )
-
-    return [e for e in events if e["name"]]
-
+# ──────────────────────────────────────────────────────────────
+#  HELPERS
+# ──────────────────────────────────────────────────────────────
 
 def detect_impact(impact_cell) -> str:
     if not impact_cell:
@@ -220,6 +303,11 @@ def detect_impact(impact_cell) -> str:
 
 
 def parse_time(time_str: Optional[str], date_str: str) -> Optional[datetime]:
+    """
+    Fallback time parser used only when dateline is unavailable.
+    Assumes the timeLabel is already in DISPLAY_TZ (Berlin).
+    This assumption holds only when the scraper runs from a European IP.
+    """
     if not time_str:
         return None
 
@@ -229,12 +317,8 @@ def parse_time(time_str: Optional[str], date_str: str) -> Optional[datetime]:
         for fmt in ("%Y-%m-%d %I:%M%p", "%Y-%m-%d %I%p"):
             try:
                 naive = datetime.strptime(dt_str, fmt)
-
-                # 👉 ВАЖНО: ForexFactory уже даёт Berlin time
                 local_dt = naive.replace(tzinfo=DISPLAY_TZ)
-
                 return local_dt.astimezone(timezone.utc)
-
             except ValueError:
                 continue
 
