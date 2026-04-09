@@ -87,7 +87,7 @@ def fetch_events() -> list:
 
 def parse_calendar_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "lxml")
-    table = soup.find("table", class_=re.compile("calendar"))
+    table = soup.find("table", id="calendar__table")
 
     if table:
         events = parse_calendar_table(table)
@@ -145,6 +145,7 @@ def parse_calendar_table(table) -> list:
                 "actual": cell_text("calendar__actual"),
             }
         )
+        log.info(f"Raw time_str: {last_time}")
 
     return events
 
