@@ -28,10 +28,11 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_THREAD_ID = os.getenv("NEWS_THREAD_ID")
 
 IMPACT_FILTER = {"High", "Medium"}
 CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "NZD"}
-ALERT_MINUTES_BEFORE = [60, 15]
+ALERT_MINUTES_BEFORE = [15]
 DISPLAY_TZ = ZoneInfo("Europe/Berlin")
 
 # ──────────────────────────────────────────────────────────────
@@ -107,10 +108,7 @@ def parse_calendar_state_from_js(html_text: str) -> list:
     can be in any timezone depending on the server's IP geolocation, but
     `dateline` is always UTC.
     """
-    # The JS block looks like:
-    #   window.calendarComponentStates[1] = {\ndays: [...],...\n}
-    # We grab everything between the opening { and the matching closing }
-    # by finding the block start then scanning for balanced braces.
+
     block_match = re.search(
         r"window\.calendarComponentStates\[\d+\]\s*=\s*(\{)",
         html_text,
@@ -133,17 +131,14 @@ def parse_calendar_state_from_js(html_text: str) -> list:
 
     raw_block = html_text[start:end]
 
-    # The block uses JS syntax (unquoted keys, trailing commas, etc.)
-    # Days array is the only part we need — extract it as valid JSON.
+
     days_match = re.search(r'"?days"?\s*:\s*(\[)', raw_block)
     if not days_match:
-        # Try without quotes (JS object literal syntax)
         days_match = re.search(r'\bdays\s*:\s*(\[)', raw_block)
     if not days_match:
         log.warning("days array not found in calendarComponentStates block")
         return []
 
-    # Extract the days array by counting brackets
     arr_start = days_match.start(1)
     depth = 0
     arr_end = arr_start
@@ -158,7 +153,6 @@ def parse_calendar_state_from_js(html_text: str) -> list:
 
     raw_days = raw_block[arr_start:arr_end]
 
-    # ForexFactory uses HTML escapes like \/ — unescape for JSON
     raw_days = raw_days.replace("\\/", "/")
 
     try:
@@ -396,7 +390,10 @@ def fmt_alert(event: dict, minutes_before: int) -> str:
 
 async def _send(text: str):
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    kwargs = dict(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    if TELEGRAM_THREAD_ID:
+        kwargs["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+    await bot.send_message(**kwargs)
 
 
 def send(text: str):
@@ -429,8 +426,67 @@ def job_refresh():
     send(fmt_digest(daily_events))
 
 
+def fmt_alert_grouped(events: list, minutes_before: int) -> str:
+    """
+    Format one or more events into a single alert message.
+    If multiple events fire at the same time they are listed together.
+    """
+    timing = "🚨 <b>HAPPENING NOW</b>" if minutes_before == 0 else f"⏰ <b>In {minutes_before} minutes</b>"
+
+    if len(events) == 1:
+        e = events[0]
+        ev_dt = e["datetime"]
+        t_str = ev_dt.astimezone(DISPLAY_TZ).strftime("%H:%M %Z") if ev_dt else "?"
+        impact = e["impact"]
+        return (
+            f"{IMPACT_EMOJI.get(impact, '⚪')} <b>{html.escape(impact.upper())} IMPACT — {html.escape(e['currency'])}</b>\n"
+            f"{timing}\n\n"
+            f"📌 <b>{html.escape(e['name'])}</b>\n"
+            f"🕐 <code>{html.escape(t_str)}</code>\n"
+            f"📈 Forecast: <code>{html.escape(e['forecast'] or 'N/A')}</code>\n"
+            f"📉 Previous: <code>{html.escape(e['previous'] or 'N/A')}</code>\n\n"
+            f"<i>Volatility incoming — manage your risk!</i> 📊"
+        )
+
+    # Multiple events — build a combined message
+    # Group header: show all currencies/impacts
+    impacts = sorted({e["impact"] for e in events}, key=lambda x: ["High", "Medium", "Low"].index(x))
+    header_icons = " ".join(IMPACT_EMOJI.get(i, "⚪") for i in impacts)
+    currencies = " · ".join(html.escape(e["currency"]) for e in events)
+
+    lines = [
+        f"{header_icons} <b>MULTIPLE EVENTS — {currencies}</b>",
+        f"{timing}",
+        "",
+    ]
+    for e in events:
+        ev_dt = e["datetime"]
+        t_str = ev_dt.astimezone(DISPLAY_TZ).strftime("%H:%M %Z") if ev_dt else "?"
+        impact = e["impact"]
+        lines.append(
+            f"{IMPACT_EMOJI.get(impact, '⚪')} <b>{html.escape(e['currency'])} — {html.escape(e['name'])}</b>"
+        )
+        lines.append(f"   🕐 <code>{html.escape(t_str)}</code>  |  Impact: <b>{html.escape(impact)}</b>")
+        lines.append(
+            f"   📈 Fcst: <code>{html.escape(e['forecast'] or 'N/A')}</code>  "
+            f"📉 Prev: <code>{html.escape(e['previous'] or 'N/A')}</code>"
+        )
+        lines.append("")
+
+    lines.append("<i>Volatility incoming — manage your risk!</i> 📊")
+    return "\n".join(lines)
+
+
 def job_check_alerts():
+    """
+    Check which events are ~15 min away and send ONE grouped message
+    per alert threshold instead of one message per event.
+    """
     now = datetime.now(timezone.utc)
+
+    # Collect all (event, threshold) pairs that should fire right now
+    # grouped by threshold so events at the same threshold fire together.
+    pending: dict[int, list] = {}  # threshold -> list of events
 
     for event in daily_events:
         ev_dt = event.get("datetime")
@@ -444,8 +500,11 @@ def job_check_alerts():
                 key = f"{event['name']}_{ev_dt.isoformat()}_{threshold}"
                 if key not in alerted_keys:
                     alerted_keys.add(key)
-                    log.info(f"🔔 Alert: {event['name']} in {threshold}min")
-                    send(fmt_alert(event, threshold))
+                    pending.setdefault(threshold, []).append(event)
+
+    for threshold, events in pending.items():
+        log.info(f"🔔 Grouped alert: {len(events)} event(s) in {threshold}min")
+        send(fmt_alert_grouped(events, threshold))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -463,7 +522,6 @@ def main():
     job_refresh()
 
     schedule.every().day.at("06:00").do(job_refresh)
-    schedule.every().day.at("12:00").do(job_refresh)
     schedule.every(1).minutes.do(job_check_alerts)
 
     log.info("Scheduler running. Ctrl+C to stop.")
