@@ -167,6 +167,8 @@ def parse_calendar_state_from_js(html_text: str) -> list:
         return []
 
     events = []
+    today_str = datetime.now(DISPLAY_TZ).strftime("%Y-%m-%d")
+
     for day in state.get("days", []):
         for item in day.get("events", []):
             time_label = (item.get("timeLabel") or "").strip()
@@ -176,10 +178,7 @@ def parse_calendar_state_from_js(html_text: str) -> list:
             impact_name = (item.get("impactName") or "").strip().lower()
             impact = impact_name.capitalize() if impact_name in {"high", "medium", "low"} else "Low"
 
-            event_dt = None
-            dateline = item.get("dateline")
-            if dateline:
-                event_dt = datetime.fromtimestamp(dateline, tz=timezone.utc)
+            event_dt = parse_time(time_label, today_str)
 
             events.append(
                 {
