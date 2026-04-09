@@ -87,20 +87,14 @@ def fetch_events() -> list:
 
 def parse_calendar_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "lxml")
+
+    # Берём ТОЛЬКО основную таблицу
     table = soup.find("table", id="calendar__table")
+    if not table:
+        log.error("❌ calendar__table not found")
+        return []
 
-    if table:
-        events = parse_calendar_table(table)
-        if events:
-            return events
-
-    log.warning("Calendar table not found or returned no rows — trying JS calendar state")
-    events = parse_calendar_state_from_js(html_text)
-    if events:
-        return events
-
-    log.warning("No calendar events parsed — check ff_debug.html")
-    return []
+    return parse_calendar_table(table)
 
 
 def parse_calendar_table(table) -> list:
@@ -112,40 +106,47 @@ def parse_calendar_table(table) -> list:
         if "calendar__row--day-breaker" in row.get("class", []):
             continue
 
-        time_cell = row.find("td", class_=re.compile("calendar__time"))
+
+        time_cell = row.find("td", class_="calendar__time")
         if time_cell:
             t = time_cell.get_text(strip=True)
             if t and t.lower() not in ("", "all day", "tentative"):
                 last_time = t
 
-        cur_cell = row.find("td", class_=re.compile("calendar__currency"))
+
+        cur_cell = row.find("td", class_="calendar__currency")
         currency = cur_cell.get_text(strip=True) if cur_cell else ""
 
-        impact_cell = row.find("td", class_=re.compile("calendar__impact"))
+
+        impact_cell = row.find("td", class_="calendar__impact")
         impact = detect_impact(impact_cell)
 
-        name_cell = row.find("td", class_=re.compile("calendar__event"))
+
+        name_cell = row.find("td", class_="calendar__event")
         name = name_cell.get_text(strip=True) if name_cell else ""
         if not name:
             continue
 
-        def cell_text(pattern: str) -> str:
-            cell = row.find("td", class_=re.compile(pattern))
+
+        def cell_text(cls):
+            cell = row.find("td", class_=cls)
             return cell.get_text(strip=True) if cell else ""
 
-        events.append(
-            {
-                "name": name,
-                "currency": currency,
-                "impact": impact,
-                "time_str": last_time or "",
-                "datetime": parse_time(last_time, today_str),
-                "forecast": cell_text("calendar__forecast"),
-                "previous": cell_text("calendar__previous"),
-                "actual": cell_text("calendar__actual"),
-            }
-        )
-        log.info(f"Raw time_str: {last_time}")
+
+        event_dt = parse_time(last_time, today_str)
+
+        log.info(f"Parsed raw time: {last_time} -> {event_dt}")
+
+        events.append({
+            "name": name,
+            "currency": currency,
+            "impact": impact,
+            "time_str": last_time or "",
+            "datetime": event_dt,
+            "forecast": cell_text("calendar__forecast"),
+            "previous": cell_text("calendar__previous"),
+            "actual": cell_text("calendar__actual"),
+        })
 
     return events
 
@@ -220,19 +221,24 @@ def detect_impact(impact_cell) -> str:
 
 
 def parse_time(time_str: Optional[str], date_str: str) -> Optional[datetime]:
-    """Convert ForexFactory local display time into UTC datetime."""
     if not time_str:
         return None
 
     try:
         dt_str = f"{date_str} {time_str.upper()}"
+
         for fmt in ("%Y-%m-%d %I:%M%p", "%Y-%m-%d %I%p"):
             try:
-                naive_dt = datetime.strptime(dt_str, fmt)
-                local_dt = naive_dt.replace(tzinfo=DISPLAY_TZ)
+                naive = datetime.strptime(dt_str, fmt)
+
+                # 👉 ВАЖНО: ForexFactory уже даёт Berlin time
+                local_dt = naive.replace(tzinfo=DISPLAY_TZ)
+
                 return local_dt.astimezone(timezone.utc)
+
             except ValueError:
                 continue
+
     except Exception as e:
         log.debug(f"Time parse failed '{time_str}': {e}")
 
