@@ -88,8 +88,7 @@ def fetch_events() -> list:
 def parse_calendar_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "lxml")
 
-    # Берём ТОЛЬКО основную таблицу
-    table = soup.find("table", id="calendar__table")
+    table = soup.find("table", class_=re.compile("calendar__table"))
     if not table:
         log.error("❌ calendar__table not found")
         return []
