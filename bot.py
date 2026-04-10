@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 
 daily_events: list = []
 alerted_keys: set = set()
-IMPACT_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+IMPACT_EMOJI = {"High": "🔴", "Medium": "🟠", "Low": "🟢"}
 
 # ──────────────────────────────────────────────────────────────
 #  SCRAPE FOREXFACTORY
